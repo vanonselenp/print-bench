@@ -12,12 +12,20 @@ chess pieces, or coat hooks. It knows about a `style.md`, a
 ## Install
 
 ```bash
-pip install -e .
+uv sync
 export MESHY_API_KEY=sk-...        # for `pb upload` / `pb fetch`
 ```
 
-Run `pb` from a directory you want to be the root, or set `PB_ROOT`.
-Projects live under `$PB_ROOT/projects/`.
+Run commands with `uv run pb` from a directory you want to be the root, or
+set `PB_ROOT` and run from the repository. Projects live under
+`$PB_ROOT/projects/`.
+
+For convenience, the examples below use `pb`. If you have not activated the
+virtualenv, prefix commands with `uv run`.
+
+```bash
+uv run pb --help
+```
 
 ## The loop
 
