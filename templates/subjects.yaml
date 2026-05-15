@@ -1,0 +1,18 @@
+# Subjects for this project. One entry per thing you want to make.
+#
+# - name: folder-safe slug, used as the directory under projects/<project>/
+# - description: the one-line brief that gets dropped into the prompt
+#
+# The description should follow the "Subject template" shape from style.md.
+
+subjects: []
+
+# Example:
+#
+# subjects:
+#   - name: at-rifle-team
+#     description: |
+#       AT rifle team (2 models): gunner prone firing PTRD-41
+#       (exaggerate the absurd length, push it visually), loader
+#       kneeling alongside pointing at imagined target. Mixed gritty
+#       dress, SSh-40 helmets, prominent AT ammo pouches.
