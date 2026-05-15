@@ -1,7 +1,7 @@
 # printbench redesign — multi-backend mesh dispatch + region cropper
 
 Date: 2026-05-15
-Status: Spec — awaiting user review
+Status: Implemented spike — Meshy-only Phase 1
 
 ## Context
 
@@ -70,12 +70,14 @@ projects/
 
     at-rifle-team/              # subject
       v1/                       # variant
-        source.png              # raw chosen image from image gen
-        regions.json            # cropper's source of truth: {front: [x,y,w,h], ...}
+        sources/
+          source-1.png          # raw chosen image from image gen
+          source-2.png          # optional separate source image
+        regions.json            # {front: {source, box}, ...}
         front.png               # crops produced from source + regions
         back.png
         top.png                 # arbitrary number of labelled views
-        task.json               # {backend, task_id, preview_url, submitted_at, params}
+        task.json               # {backend, task_id, submitted_at, params, views}
         model.stl               # only present after `pb fetch` — never auto-downloaded
       v2/
         ...
@@ -86,8 +88,8 @@ projects/
 ```
 
 Rationale:
-- `source.png` + `regions.json` are first-class artefacts (user-confirmed). Re-cropping is cheap and replayable; if a lesson teaches you a tighter front crop helps the backend, you re-open the cropper on the same source without regenerating the image.
-- `task.json` separate from `model.stl` is the encoded "judgement at the mesh layer" rule — a task can be submitted, have a preview URL waiting indefinitely, and never produce a `model.stl` if the user decides the mesh is not good enough.
+- `sources/` + `regions.json` are first-class artefacts (user-confirmed). Re-cropping is cheap and replayable; if a lesson teaches you a tighter front crop helps the backend, you re-open the cropper on the same sources without regenerating the image. A variant can use one combined source image or multiple separate source files.
+- `task.json` separate from `model.stl` is the encoded "judgement at the mesh layer" rule — a task can be submitted and never produce a `model.stl` if the user decides the mesh is not good enough. Meshy exposes thumbnails/model URLs from status responses, not a stable documented web preview URL at submit time.
 - N labelled views (not hardcoded front/back) — backends that accept 4 views (Meshy) and single-view backends are both addressable from the same project tree; the adapter takes what it can use.
 
 ## Command surface
@@ -96,16 +98,17 @@ Rationale:
 |---|---|---|
 | `pb init <project>` | Scaffold project dir with `style.md`, `subjects.yaml`, placeholder `seed.png` | unchanged |
 | `pb prompt <project> <subject>` | Assemble brief from style.md + subject, clipboard it | unchanged |
-| `pb crop <project> <subject> <variant> <image>` | Auto-create variant dir, copy image → `source.png`, open localhost cropper, on save write `regions.json` + per-view PNGs | **new (subsumes `stage`)** |
-| `pb upload <project> <subject> <variant> [--backend X] [--param k=v ...]` | Submit labelled views to backend, write `task.json` with task id + preview URL, exit | **was `meshify`, now upload-only** |
+| `pb crop <project> <subject> <variant> <image...>` | Auto-create variant dir, copy image(s) → `sources/`, open localhost cropper, on save write `regions.json` + per-view PNGs | **new (subsumes `stage`)** |
+| `pb upload <project> <subject> <variant> [--backend X] [--param k=v ...]` | Submit labelled views to backend, write `task.json` with task id, exit | **was `meshify`, now upload-only** |
 | `pb fetch <project> <subject> <variant>` | Read `task.json`, check status, download model → `model.stl`. Only when user runs it. | **new (extracted from `meshify`)** |
 | `pb retry <project> <subject> <variant> [--backend X] [--param k=v ...]` | Resubmit same crops with different backend/params; archive prior `task.json` → `task.N.json` where N is the next free integer | **new** |
+| `pb recrop <project> <subject> <variant>` | Reopen the cropper without adding new sources | **new** |
 | `pb learn <project> "<lesson>"` | Append dated entry to style.md | unchanged |
 | `pb list <project>` | Per-subject summary with variant states: `empty` / `cropped` / `mesh-pending` / `mesh-ready` / `stl` | **extended state vocabulary** |
 
 `pb stage` is removed. `pb crop` auto-creates the variant directory; "reserving" an empty variant has no real use case.
 
-`pb upload` blocks only for the submit round trip (seconds), then exits — it never polls for completion. This is the load-bearing change versus today's `meshify`. The user evaluates the preview URL out-of-band.
+`pb upload` blocks only for the submit round trip (seconds), then exits — it never polls for completion. This is the load-bearing change versus today's `meshify`. The user evaluates the mesh out-of-band before choosing whether to run `pb fetch`.
 
 ## Variant lifecycle
 
@@ -123,8 +126,8 @@ pb crop soviets at-rifle-team v1 ~/Downloads/at-team.png
 # click save — server exits, files land in variant dir
 
 pb upload soviets at-rifle-team v1 --backend meshy
-# prints: task abc123 submitted; preview: https://meshy.ai/...
-# user opens preview URL, looks at mesh, decides
+# prints: task abc123 submitted
+# user inspects the Meshy/API result, looks at mesh, decides
 
 pb fetch soviets at-rifle-team v1
 # downloads model.stl into variant dir
@@ -151,7 +154,7 @@ class MeshBackend(Protocol):
     accepted_views: set[str]     # e.g. {"front", "back", "left", "right"}
 
     def submit(self, views: dict[str, Path], params: dict) -> SubmitResult: ...
-    # → {"task_id": str, "preview_url": str}
+    # → {"task_id": str}
 
     def status(self, task_id: str) -> StatusResult: ...
     # → {"state": "pending" | "ready" | "failed",
@@ -164,7 +167,7 @@ class MeshBackend(Protocol):
 
 - `views`: `{"front": Path, "back": Path, ...}` — adapter takes only labels in its `accepted_views`, logs and drops the rest.
 - `params`: free dict; backend-specific knobs (`topology=triangle`, `should_remesh=true`, Hi3D equivalents) live in the adapter without polluting the CLI surface. `pb upload --param k=v` repeated for each. Values arrive at the adapter as strings; the adapter is responsible for type coercion (`"true"` → `True`, etc.) and for rejecting unknown keys with a clear error.
-- `pb upload <project> <subject> <variant> --backend X` looks up the adapter by name, calls `submit`, writes `task.json`.
+- `pb upload <project> <subject> <variant> --backend X` looks up the adapter by name, calls `submit`, writes `task.json`. Meshy accepts an ordered array rather than labelled views, so the adapter maps local labels to `front`, `back`, `left`, `right`, then custom labels and submits at most four images.
 - `pb fetch` reads `task.json`, looks up the adapter, calls `status`; if `ready`, calls `fetch` and writes `model.stl`. If `pending`, prints status and exits non-zero — caller can re-run later or use `--wait` to poll.
 - New backend = one new file in `pb/backends/` + one line in a registry dict. No core changes.
 - The existing Meshy code in `pb/cli.py` is extracted to `pb/backends/meshy.py`, edited to fit the protocol.
@@ -176,7 +179,7 @@ API keys: env vars per backend (`MESHY_API_KEY`, `HI3D_API_KEY`, …) read by th
 - Python stdlib `http.server` running on a chosen free port (picked at runtime to avoid collisions).
 - Three routes:
   - `GET /` → HTML page (one vanilla-JS file, ~200 lines, no framework). Loads `regions.json` if present so previously-drawn rectangles are restored.
-  - `GET /source.png` → serves the variant's source image.
+  - `GET /sources/<name>` → serves a variant source image.
   - `POST /save` → receives `{regions: {<label>: [x, y, w, h], ...}}`, runs PIL crops, writes per-view PNGs + updated `regions.json`, then returns 200 and signals the CLI to shut the server down and exit cleanly.
 - Re-running `pb crop` on a variant with existing `regions.json` restores the rectangles for nudging.
 - Labels: a dropdown of common ones (`front`, `back`, `left`, `right`, `top`) plus a "custom" text option. The cropper does not enforce which labels are valid — the backend adapter handles "I can't use this view, dropping it."
@@ -188,7 +191,7 @@ API keys: env vars per backend (`MESHY_API_KEY`, `HI3D_API_KEY`, …) read by th
 - Cropper port in use: pick a free port. Print the chosen URL.
 - Cropper save with zero-area or overlapping-to-meaninglessness regions: reject with a message; the cropper UI also disables save until at least one labelled region exists.
 - `pb upload` submit failure: print backend error, exit non-zero. No state written to `task.json`.
-- `pb fetch` while task is still pending: print state + preview URL, exit non-zero. User re-runs later, or uses `--wait`.
+- `pb fetch` while task is still pending: print state and progress, exit non-zero. User re-runs later, or uses `--wait`.
 - `pb fetch` on a `failed` task: print error, exit non-zero. User can run `pb retry` with different params.
 - Missing backend API key env var: print the expected env var name and exit before any submission.
 
@@ -217,14 +220,16 @@ Explicitly out of scope for the skill: picking variations, choosing meshes, deci
 2. Add `pb crop`, `pb upload`, `pb fetch`, `pb retry`.
 3. Remove `pb stage` (it's subsumed by `pb crop`'s auto-create).
 4. Extend `pb list` state vocabulary.
-5. Add a second backend stub (`pb/backends/hi3d.py`) to validate the adapter shape against more than just Meshy, even if Hi3D support is initially a placeholder.
+5. Defer non-Meshy backends until Meshy-only usage has validated the workflow.
 
 ## Open questions
 
 None at spec time. Resolved during brainstorming:
 - ✅ Region-crop-on-single-image is the right model for image capture
-- ✅ `source.png` + `regions.json` are first-class artefacts in the variant dir
+- ✅ `sources/` + `regions.json` are first-class artefacts in the variant dir
 - ✅ `stage` is subsumed by `crop`
 - ✅ Adapter shape: `submit` / `status` / `fetch` + free-form params dict
 - ✅ Cropper stack: stdlib `http.server` + vanilla JS
 - ✅ Skill is Phase 2, designed against real Phase-1 usage
+- ✅ Prompt history is not required for v1
+- ✅ First real backend is Meshy only

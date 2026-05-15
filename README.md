@@ -1,19 +1,19 @@
-# pb — printbench
+# pb - printbench
 
 A small CLI for the disciplined loop:
 
-    style → subject → 3 pose suggestions (text) → seed image →
-    3 visual variations → pick → Meshy → STL → slicer → print
+    style -> subject -> prompt -> image generation -> labelled crops ->
+    Meshy upload -> human judgement -> explicit fetch -> slicer -> print
 
 Domain-agnostic. `pb` knows nothing about soldiers, monsters, terrain,
 chess pieces, or coat hooks. It knows about a `style.md`, a
-`subjects.yaml`, and a Meshy multi-image-to-3D endpoint.
+`subjects.yaml`, local image artefacts, and Meshy's multi-image-to-3D API.
 
 ## Install
 
 ```bash
 pip install -e .
-export MESHY_API_KEY=sk-...        # for `pb meshify`
+export MESHY_API_KEY=sk-...        # for `pb upload` / `pb fetch`
 ```
 
 Run `pb` from a directory you want to be the root, or set `PB_ROOT`.
@@ -26,32 +26,69 @@ pb init soviets
 # edit projects/soviets/style.md, drop in seed.png, list subjects in subjects.yaml
 
 pb prompt soviets at-rifle-team
-# clipboards the full brief — paste into ChatGPT, get 3 pose suggestions in text,
-# then send the seed image and ask for the chosen pose front+back
+# copies the full brief; paste into ChatGPT/Gemini/Claude and iterate there
 
-pb stage soviets at-rifle-team v1
-# creates projects/soviets/at-rifle-team/v1/  — drop front.png and back.png there
+pb crop soviets at-rifle-team v1 ~/Downloads/at-team.png
+# opens a local browser cropper; draw labelled regions like front/back/top
 
-pb meshify soviets at-rifle-team v1
-# uploads both views, polls, downloads model.stl into the same folder
+pb upload soviets at-rifle-team v1 --backend meshy
+# uploads cropped views, writes task.json, exits without polling or downloading
 
-pb learn soviets "Add 'no thin protrusions' — sniper rifle snapped on print bed."
+pb fetch soviets at-rifle-team v1
+# only downloads model.stl once you choose to keep the mesh
+
+pb learn soviets "Tighter front crop helps Meshy resolve the helmet."
 # dated entry appended to style.md
 ```
 
+If the image generator gives separate files instead of one combined sheet,
+pass them all to `pb crop`:
+
+```bash
+pb crop soviets at-rifle-team v2 ~/Downloads/front.png ~/Downloads/back.png
+```
+
+The cropper stores sources and reusable crop state under the variant:
+
+```text
+projects/soviets/at-rifle-team/v1/
+  sources/source-1.png
+  regions.json
+  front.png
+  back.png
+  task.json
+  model.stl
+```
+
+Use `pb recrop soviets at-rifle-team v1` to reopen the cropper without
+adding new sources.
+
 ## What `pb` deliberately does not do
 
-- **Generate images.** Stays in ChatGPT. The conversational "now show
-  me three more" affordance is doing real work in the judgement loop;
-  scripting it away would lose the part that matters.
+- **Generate images.** That stays in the image model UI because the
+  conversational "show me three more" loop is judgement work.
 - **Pick the best variation.** That's the user's eye.
-- **Slice.** Bambu Studio is fine. Hand off the STL and stop.
+- **Decide a mesh is good enough.** `pb upload` does not download;
+  `pb fetch` is the explicit commit step.
+- **Slice.** Bambu Studio or another slicer owns that step.
 
 ## What it does do
 
-- Reuse `style.md` across every subject in a project, so constraints
-  learned once are applied every time.
-- Make `style.md` a versioned, forkable, shareable artefact with a
-  built-in `Lessons` changelog.
-- Eliminate the Meshy upload-two-files-and-wait dance.
-- Show you at a glance which subjects are sketched, ready, or done.
+- Reuse `style.md` across every subject in a project.
+- Keep source images, labelled crops, backend task metadata, and final
+  models in a browsable project tree.
+- Let a single variant use one combined source image or multiple source
+  files.
+- Submit up to four ordered cropped views to Meshy.
+- Show subject/variant state with `pb list`.
+
+## Meshy notes
+
+Meshy's multi-image endpoint accepts one to four images as an ordered array,
+not labelled views. `pb` keeps labels locally and uploads them in this order:
+
+```text
+front, back, left, right, top, bottom, then any custom labels alphabetically
+```
+
+Extra views beyond Meshy's four-image limit are dropped with a warning.
