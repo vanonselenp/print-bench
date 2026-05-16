@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -36,7 +37,17 @@ except ImportError:
     HAS_CLIPBOARD = False
 
 
-ROOT = Path(os.environ.get("PB_ROOT", Path.cwd()))
+def discover_root() -> Path:
+    if os.environ.get("PB_ROOT"):
+        return Path(os.environ["PB_ROOT"]).expanduser().resolve()
+    cwd = Path.cwd().resolve()
+    for path in (cwd, *cwd.parents):
+        if (path / "projects").is_dir():
+            return path
+    return cwd
+
+
+ROOT = discover_root()
 PROJECTS = ROOT / "projects"
 TEMPLATES = Path(__file__).parent.parent / "templates"
 
@@ -45,6 +56,91 @@ MESHY_ENDPOINT = f"{MESHY_API_BASE}/multi-image-to-3d"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom"]
 TASK_ARCHIVE_RE = re.compile(r"^task\.(\d+)\.json$")
+
+
+def current_context() -> dict[str, str | None]:
+    context: dict[str, str | None] = {"project": None, "subject": None, "variant": None}
+    try:
+        rel = Path.cwd().resolve().relative_to(PROJECTS.resolve())
+    except ValueError:
+        return context
+    parts = rel.parts
+    if len(parts) >= 1:
+        context["project"] = parts[0]
+    if len(parts) >= 2:
+        context["subject"] = parts[1]
+    if len(parts) >= 3:
+        context["variant"] = parts[2]
+    return context
+
+
+def fail_usage(command: str, examples: list[str]) -> None:
+    click.echo(f"error: not enough context for pb {command}", err=True)
+    click.echo("examples:", err=True)
+    for example in examples:
+        click.echo(f"  {example}", err=True)
+    sys.exit(1)
+
+
+def resolve_project_arg(project: str | None, command: str) -> str:
+    if project:
+        return project
+    inferred = current_context()["project"]
+    if inferred:
+        return inferred
+    fail_usage(command, [f"pb {command} <project>", f"cd projects/<project> && pb {command}"])
+
+
+def resolve_subject_args(args: tuple[str, ...], command: str) -> tuple[str, str]:
+    ctx = current_context()
+    project = ctx["project"]
+    subject = ctx["subject"]
+
+    if project and args and args[0] == project and len(args) >= 2:
+        return args[0], args[1]
+    if project and subject and not args:
+        return project, subject
+    if project and len(args) >= 1:
+        return project, args[0]
+    if len(args) >= 2:
+        return args[0], args[1]
+
+    fail_usage(
+        command,
+        [
+            f"pb {command} <project> <subject>",
+            f"cd projects/<project> && pb {command} <subject>",
+            f"cd projects/<project>/<subject> && pb {command}",
+        ],
+    )
+
+
+def resolve_variant_args(args: tuple[str, ...], command: str) -> tuple[str, str, str, tuple[str, ...]]:
+    ctx = current_context()
+    project = ctx["project"]
+    subject = ctx["subject"]
+    variant = ctx["variant"]
+
+    if project and args and args[0] == project and len(args) >= 3:
+        return args[0], args[1], args[2], args[3:]
+    if project and subject and variant:
+        return project, subject, variant, args
+    if project and subject and len(args) >= 1:
+        return project, subject, args[0], args[1:]
+    if project and len(args) >= 2:
+        return project, args[0], args[1], args[2:]
+    if len(args) >= 3:
+        return args[0], args[1], args[2], args[3:]
+
+    fail_usage(
+        command,
+        [
+            f"pb {command} <project> <subject> <variant>",
+            f"cd projects/<project> && pb {command} <subject> <variant>",
+            f"cd projects/<project>/<subject> && pb {command} <variant>",
+            f"cd projects/<project>/<subject>/<variant> && pb {command}",
+        ],
+    )
 
 
 def project_dir(project: str) -> Path:
@@ -643,10 +739,10 @@ def init(project: str) -> None:
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-def prompt(project: str, subject: str) -> None:
+@click.argument("args", nargs=-1)
+def prompt(args: tuple[str, ...]) -> None:
     """Assemble a prompt for a subject and copy it to the clipboard."""
+    project, subject = resolve_subject_args(args, "prompt")
     require_project(project)
     subj = find_subject(project, subject)
     sections = parse_style(project)
@@ -691,12 +787,10 @@ def prompt(project: str, subject: str) -> None:
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
-@click.argument("images", nargs=-1, type=click.Path(exists=True, dir_okay=False, readable=False, path_type=str))
-def crop(project: str, subject: str, variant: str, images: tuple[str, ...]) -> None:
+@click.argument("args", nargs=-1, type=click.Path(exists=False, readable=False, path_type=str))
+def crop(args: tuple[str, ...]) -> None:
     """Copy source images, then open a browser cropper for labelled views."""
+    project, subject, variant, images = resolve_variant_args(args, "crop")
     require_project(project)
     find_subject(project, subject)
     target = variant_dir(project, subject, variant)
@@ -711,11 +805,13 @@ def crop(project: str, subject: str, variant: str, images: tuple[str, ...]) -> N
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
-def recrop(project: str, subject: str, variant: str) -> None:
+@click.argument("args", nargs=-1)
+def recrop(args: tuple[str, ...]) -> None:
     """Reopen the cropper for an existing variant without adding sources."""
+    project, subject, variant, extra = resolve_variant_args(args, "recrop")
+    if extra:
+        click.echo("error: recrop does not accept image arguments", err=True)
+        sys.exit(1)
     require_project(project)
     find_subject(project, subject)
     target = variant_dir(project, subject, variant)
@@ -728,13 +824,15 @@ def recrop(project: str, subject: str, variant: str) -> None:
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
 @click.option("--backend", default="meshy", show_default=True)
 @click.option("--param", "params", multiple=True, help="Backend parameter as k=v.")
-def upload(project: str, subject: str, variant: str, backend: str, params: tuple[str, ...]) -> None:
+@click.argument("args", nargs=-1)
+def upload(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None:
     """Submit labelled views to a backend and write task.json. Does not fetch."""
+    project, subject, variant, extra = resolve_variant_args(args, "upload")
+    if extra:
+        click.echo("error: upload does not accept image arguments", err=True)
+        sys.exit(1)
     require_project(project)
     find_subject(project, subject)
     if backend != "meshy":
@@ -754,11 +852,13 @@ def upload(project: str, subject: str, variant: str, backend: str, params: tuple
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
-def status(project: str, subject: str, variant: str) -> None:
+@click.argument("args", nargs=-1)
+def status(args: tuple[str, ...]) -> None:
     """Print backend task status and preview/download URLs."""
+    project, subject, variant, extra = resolve_variant_args(args, "status")
+    if extra:
+        click.echo("error: status does not accept extra arguments", err=True)
+        sys.exit(1)
     _, stored = load_task(project, subject, variant)
     task = get_meshy_task(stored["task_id"])
     click.echo(f"task: {stored['task_id']}")
@@ -775,13 +875,15 @@ def status(project: str, subject: str, variant: str) -> None:
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
 @click.option("--wait", is_flag=True, help="Poll until task completes.")
 @click.option("--poll-interval", default=10, show_default=True)
-def fetch(project: str, subject: str, variant: str, wait: bool, poll_interval: int) -> None:
+@click.argument("args", nargs=-1)
+def fetch(wait: bool, poll_interval: int, args: tuple[str, ...]) -> None:
     """Fetch model.stl for a completed task. Only downloads when run explicitly."""
+    project, subject, variant, extra = resolve_variant_args(args, "fetch")
+    if extra:
+        click.echo("error: fetch does not accept extra arguments", err=True)
+        sys.exit(1)
     target, stored = load_task(project, subject, variant)
     task_file = task_path(target)
 
@@ -811,13 +913,15 @@ def fetch(project: str, subject: str, variant: str, wait: bool, poll_interval: i
 
 
 @cli.command()
-@click.argument("project")
-@click.argument("subject")
-@click.argument("variant")
 @click.option("--backend", default="meshy", show_default=True)
 @click.option("--param", "params", multiple=True, help="Backend parameter as k=v.")
-def retry(project: str, subject: str, variant: str, backend: str, params: tuple[str, ...]) -> None:
+@click.argument("args", nargs=-1)
+def retry(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None:
     """Archive the current task.json and resubmit the same cropped views."""
+    project, subject, variant, extra = resolve_variant_args(args, "retry")
+    if extra:
+        click.echo("error: retry does not accept image arguments", err=True)
+        sys.exit(1)
     require_project(project)
     find_subject(project, subject)
     if backend != "meshy":
@@ -831,11 +935,45 @@ def retry(project: str, subject: str, variant: str, backend: str, params: tuple[
     click.echo(f"task: {result['task_id']}")
 
 
+@cli.command(name="open")
+@click.argument("args", nargs=-1)
+def open_cmd(args: tuple[str, ...]) -> None:
+    """Open the best local artifact for a variant."""
+    project, subject, variant, extra = resolve_variant_args(args, "open")
+    if extra:
+        click.echo("error: open does not accept extra arguments", err=True)
+        sys.exit(1)
+    require_project(project)
+    find_subject(project, subject)
+    target = variant_dir(project, subject, variant)
+    if not target.is_dir():
+        click.echo(f"error: variant not found: {target}", err=True)
+        sys.exit(1)
+
+    candidates = [
+        target / "model.stl",
+        target / "front.png",
+        sources_dir(target),
+        target,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            subprocess.run(["open", str(candidate)], check=False)
+            click.echo(f"opened {candidate}")
+            return
+
+
 @cli.command()
-@click.argument("project")
-@click.argument("lesson")
-def learn(project: str, lesson: str) -> None:
+@click.argument("args", nargs=-1, required=True)
+def learn(args: tuple[str, ...]) -> None:
     """Append a dated lesson to style.md."""
+    ctx_project = current_context()["project"]
+    if ctx_project and len(args) == 1:
+        project, lesson = ctx_project, args[0]
+    elif len(args) >= 2:
+        project, lesson = args[0], " ".join(args[1:])
+    else:
+        fail_usage("learn", ['pb learn <project> "<lesson>"', 'cd projects/<project> && pb learn "<lesson>"'])
     require_project(project)
     path = style_path(project)
     text = path.read_text()
@@ -855,9 +993,10 @@ def learn(project: str, lesson: str) -> None:
 
 
 @cli.command(name="list")
-@click.argument("project")
-def list_cmd(project: str) -> None:
+@click.argument("project", required=False)
+def list_cmd(project: str | None) -> None:
     """Show subjects and their current state."""
+    project = resolve_project_arg(project, "list")
     require_project(project)
     subjects = load_subjects(project)
     if not subjects:

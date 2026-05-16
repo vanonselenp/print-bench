@@ -27,33 +27,61 @@ virtualenv, prefix commands with `uv run`.
 uv run pb --help
 ```
 
+For interactive use, activate the virtualenv or add an alias so tab
+completion and paths feel normal:
+
+```bash
+source .venv/bin/activate
+# or: alias pb='uv run pb'
+```
+
 ## The loop
 
 ```bash
 pb init soviets
 # edit projects/soviets/style.md, drop in seed.png, list subjects in subjects.yaml
 
-pb prompt soviets at-rifle-team
+cd projects/soviets
+
+pb list
+
+pb prompt at-rifle-team
 # copies the full brief; paste into ChatGPT/Gemini/Claude and iterate there
 
-pb crop soviets at-rifle-team v1 ~/Downloads/at-team.png
+pb crop at-rifle-team v1
 # opens a local browser cropper; draw labelled regions like front/back/top
+# drag an image into the browser, or use the upload control
 
-pb upload soviets at-rifle-team v1 --backend meshy
+pb upload at-rifle-team v1 --backend meshy
 # uploads cropped views, writes task.json, exits without polling or downloading
 
-pb fetch soviets at-rifle-team v1
+pb status at-rifle-team v1
+# prints Meshy task progress, thumbnail URL, and model URLs when available
+
+pb fetch at-rifle-team v1
 # only downloads model.stl once you choose to keep the mesh
 
-pb learn soviets "Tighter front crop helps Meshy resolve the helmet."
+pb open at-rifle-team v1
+# opens model.stl, front.png, sources/, or the variant folder; whichever exists first
+
+pb learn "Tighter front crop helps Meshy resolve the helmet."
 # dated entry appended to style.md
+```
+
+Commands infer context from the current directory. These are equivalent:
+
+```bash
+pb status soviets at-rifle-team v1
+cd projects/soviets && pb status at-rifle-team v1
+cd projects/soviets/at-rifle-team && pb status v1
+cd projects/soviets/at-rifle-team/v1 && pb status
 ```
 
 If the image generator gives separate files instead of one combined sheet,
 pass them all to `pb crop`:
 
 ```bash
-pb crop soviets at-rifle-team v2 ~/Downloads/front.png ~/Downloads/back.png
+pb crop at-rifle-team v2 ~/Downloads/front.png ~/Downloads/back.png
 ```
 
 The cropper stores sources and reusable crop state under the variant:
@@ -68,8 +96,8 @@ projects/soviets/at-rifle-team/v1/
   model.stl
 ```
 
-Use `pb recrop soviets at-rifle-team v1` to reopen the cropper without
-adding new sources.
+Use `pb recrop at-rifle-team v1` to reopen the cropper without adding new
+sources.
 
 ## What `pb` deliberately does not do
 
@@ -89,6 +117,8 @@ adding new sources.
   files.
 - Submit up to four ordered cropped views to Meshy.
 - Show subject/variant state with `pb list`.
+- Infer project, subject, and variant from the current directory so common
+  commands stay short.
 
 ## Meshy notes
 
