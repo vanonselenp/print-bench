@@ -588,7 +588,12 @@ def prompt(project: str, subject: str) -> None:
 @click.argument("project")
 @click.argument("subject")
 @click.argument("variant")
-@click.argument("images", nargs=-1, required=True)
+@click.argument(
+    "images",
+    nargs=-1,
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+)
 def crop(project: str, subject: str, variant: str, images: tuple[str, ...]) -> None:
     """Copy source images, then open a browser cropper for labelled views."""
     require_project(project)
