@@ -586,6 +586,22 @@ def download_meshy_model(task: dict) -> bytes:
         return response.content
 
 
+def load_task(project: str, subject: str, variant: str) -> tuple[Path, dict]:
+    require_project(project)
+    find_subject(project, subject)
+    target = variant_dir(project, subject, variant)
+    task_file = task_path(target)
+    if not task_file.exists():
+        click.echo(f"error: no task.json in {target}", err=True)
+        click.echo(f"hint: pb upload {project} {subject} {variant}", err=True)
+        sys.exit(1)
+    stored = read_json(task_file, {})
+    if stored.get("backend") != "meshy":
+        click.echo(f"error: unsupported backend in task.json: {stored.get('backend')}", err=True)
+        sys.exit(1)
+    return target, stored
+
+
 def archive_task(target: Path) -> None:
     current = task_path(target)
     if not current.exists():
@@ -741,22 +757,33 @@ def upload(project: str, subject: str, variant: str, backend: str, params: tuple
 @click.argument("project")
 @click.argument("subject")
 @click.argument("variant")
+def status(project: str, subject: str, variant: str) -> None:
+    """Print backend task status and preview/download URLs."""
+    _, stored = load_task(project, subject, variant)
+    task = get_meshy_task(stored["task_id"])
+    click.echo(f"task: {stored['task_id']}")
+    click.echo(f"status: {task.get('status')} progress={task.get('progress', 0)}%")
+    if task.get("thumbnail_url"):
+        click.echo(f"thumbnail: {task['thumbnail_url']}")
+    urls = task.get("model_urls") or {}
+    for fmt in ("stl", "glb", "fbx", "obj", "usdz", "3mf"):
+        if urls.get(fmt):
+            click.echo(f"{fmt}: {urls[fmt]}")
+    error = (task.get("task_error") or {}).get("message")
+    if error:
+        click.echo(f"error: {error}", err=True)
+
+
+@cli.command()
+@click.argument("project")
+@click.argument("subject")
+@click.argument("variant")
 @click.option("--wait", is_flag=True, help="Poll until task completes.")
 @click.option("--poll-interval", default=10, show_default=True)
 def fetch(project: str, subject: str, variant: str, wait: bool, poll_interval: int) -> None:
     """Fetch model.stl for a completed task. Only downloads when run explicitly."""
-    require_project(project)
-    find_subject(project, subject)
-    target = variant_dir(project, subject, variant)
+    target, stored = load_task(project, subject, variant)
     task_file = task_path(target)
-    if not task_file.exists():
-        click.echo(f"error: no task.json in {target}", err=True)
-        click.echo(f"hint: pb upload {project} {subject} {variant}", err=True)
-        sys.exit(1)
-    stored = read_json(task_file, {})
-    if stored.get("backend") != "meshy":
-        click.echo(f"error: unsupported backend in task.json: {stored.get('backend')}", err=True)
-        sys.exit(1)
 
     while True:
         task = get_meshy_task(stored["task_id"])
