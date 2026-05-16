@@ -170,9 +170,48 @@ def copy_sources(paths: tuple[str, ...], target: Path) -> list[str]:
         source = Path(raw).expanduser()
         validate_image(source)
         name = f"source-{idx}{source.suffix.lower()}"
-        shutil.copy(source, src_dir / name)
+        try:
+            shutil.copy(source, src_dir / name)
+        except PermissionError:
+            click.echo(f"error: cannot read image: {source}", err=True)
+            click.echo(
+                "hint: grant your terminal access to Downloads, or move the image into this project first",
+                err=True,
+            )
+            sys.exit(1)
         copied.append(name)
     return copied
+
+
+def next_source_name(target: Path, suffix: str) -> str:
+    src_dir = sources_dir(target)
+    src_dir.mkdir(parents=True, exist_ok=True)
+    existing = sorted(
+        (
+            int(p.stem.split("-", 1)[1])
+            for p in src_dir.iterdir()
+            if p.is_file() and p.stem.startswith("source-") and p.suffix.lower() in IMAGE_EXTS
+        ),
+        reverse=True,
+    )
+    return f"source-{(existing[0] + 1) if existing else 1}{suffix}"
+
+
+def save_uploaded_source(target: Path, filename: str, data_url: str) -> str:
+    match = re.match(r"^data:(image/(?:png|jpeg));base64,(.+)$", data_url)
+    if not match:
+        raise ValueError("upload must be a PNG or JPEG image")
+    mime, encoded = match.groups()
+    suffix = Path(filename).suffix.lower()
+    if suffix not in IMAGE_EXTS:
+        suffix = ".jpg" if mime == "image/jpeg" else ".png"
+    name = next_source_name(target, suffix)
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise ValueError("invalid image upload") from exc
+    (sources_dir(target) / name).write_bytes(data)
+    return name
 
 
 def list_sources(target: Path) -> list[str]:
@@ -235,6 +274,7 @@ button { cursor: pointer; background: #d38331; color: #120f0d; border: 0; font-w
 button.secondary { background: #38332e; color: #f4efe8; }
 main { display: grid; grid-template-columns: 1fr 260px; gap: 16px; padding: 16px; }
 #stage { overflow: auto; background: #0e0d0c; border-radius: 10px; padding: 12px; }
+#stage.dragover { outline: 3px dashed #d38331; outline-offset: -8px; background: #1d1711; }
 #wrap { position: relative; display: inline-block; }
 #img { display: block; max-width: calc(100vw - 340px); height: auto; user-select: none; }
 .box { position: absolute; border: 3px solid #ffb000; background: rgb(255 176 0 / 13%); box-sizing: border-box; }
@@ -247,6 +287,7 @@ li { margin: 8px 0; }
 <body>
 <header>
   <label>Source <select id="source"></select></label>
+  <label>Upload <input id="upload" type="file" accept="image/png,image/jpeg"></label>
   <label>Label <select id="label"><option>front</option><option>back</option><option>left</option><option>right</option><option>top</option><option>bottom</option><option value="custom">custom</option></select></label>
   <input id="custom" placeholder="custom label" hidden>
   <button id="save">Save crops</button>
@@ -260,9 +301,11 @@ li { margin: 8px 0; }
 const img = document.getElementById('img');
 const wrap = document.getElementById('wrap');
 const sourceSelect = document.getElementById('source');
+const upload = document.getElementById('upload');
 const labelSelect = document.getElementById('label');
 const custom = document.getElementById('custom');
 const list = document.getElementById('regions');
+const stage = document.getElementById('stage');
 let state = { sources: [], regions: {} };
 let drawing = null;
 
@@ -276,7 +319,10 @@ function imagePoint(ev) {
   const s = scale();
   return { x: Math.round((ev.clientX - r.left) * s), y: Math.round((ev.clientY - r.top) * s) };
 }
-function loadSource() { img.src = '/sources/' + encodeURIComponent(sourceSelect.value); render(); }
+function loadSource() {
+  if (!sourceSelect.value) { img.removeAttribute('src'); render(); return; }
+  img.src = '/sources/' + encodeURIComponent(sourceSelect.value); render();
+}
 function render() {
   wrap.querySelectorAll('.box').forEach(e => e.remove());
   const current = sourceSelect.value;
@@ -303,12 +349,45 @@ function render() {
 async function boot() {
   const res = await fetch('/state');
   state = await res.json();
+  refreshSources();
+  sourceSelect.addEventListener('change', loadSource);
+  upload.addEventListener('change', uploadFile);
+  stage.addEventListener('dragover', ev => { ev.preventDefault(); stage.classList.add('dragover'); });
+  stage.addEventListener('dragleave', () => stage.classList.remove('dragover'));
+  stage.addEventListener('drop', dropFiles);
+  labelSelect.addEventListener('change', () => custom.hidden = labelSelect.value !== 'custom');
+  img.addEventListener('load', render);
+  loadSource();
+}
+function refreshSources() {
+  sourceSelect.innerHTML = '';
   for (const src of state.sources) {
     const opt = document.createElement('option'); opt.value = src; opt.textContent = src; sourceSelect.appendChild(opt);
   }
-  sourceSelect.addEventListener('change', loadSource);
-  labelSelect.addEventListener('change', () => custom.hidden = labelSelect.value !== 'custom');
-  img.addEventListener('load', render);
+}
+async function uploadFile() {
+  const file = upload.files[0];
+  if (!file) return;
+  await uploadOne(file);
+  upload.value = '';
+}
+async function dropFiles(ev) {
+  ev.preventDefault();
+  stage.classList.remove('dragover');
+  const files = Array.from(ev.dataTransfer.files).filter(file => file.type === 'image/png' || file.type === 'image/jpeg');
+  if (!files.length) { alert('Drop PNG or JPEG images.'); return; }
+  for (const file of files) await uploadOne(file);
+}
+async function uploadOne(file) {
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(file);
+  });
+  const res = await fetch('/upload', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ name: file.name, data: dataUrl }) });
+  if (!res.ok) { alert(await res.text()); return; }
+  const result = await res.json();
+  state.sources.push(result.name);
+  refreshSources();
+  sourceSelect.value = result.name;
   loadSource();
 }
 img.addEventListener('mousedown', ev => { if (!label()) return; drawing = { start: imagePoint(ev) }; });
@@ -367,7 +446,18 @@ def run_cropper(target: Path) -> None:
             self.send_bytes(404, b"not found", "text/plain")
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/save":
+            path = urlparse(self.path).path
+            if path == "/upload":
+                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    payload = json.loads(self.rfile.read(length).decode())
+                    name = save_uploaded_source(target, payload.get("name") or "source.png", payload.get("data") or "")
+                except Exception as exc:
+                    self.send_bytes(400, str(exc).encode(), "text/plain")
+                    return
+                self.send_bytes(200, json.dumps({"name": name}).encode(), "application/json")
+                return
+            if path != "/save":
                 self.send_bytes(404, b"not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", "0"))
@@ -588,20 +678,18 @@ def prompt(project: str, subject: str) -> None:
 @click.argument("project")
 @click.argument("subject")
 @click.argument("variant")
-@click.argument(
-    "images",
-    nargs=-1,
-    required=True,
-    type=click.Path(exists=True, dir_okay=False, path_type=str),
-)
+@click.argument("images", nargs=-1, type=click.Path(exists=True, dir_okay=False, readable=False, path_type=str))
 def crop(project: str, subject: str, variant: str, images: tuple[str, ...]) -> None:
     """Copy source images, then open a browser cropper for labelled views."""
     require_project(project)
     find_subject(project, subject)
     target = variant_dir(project, subject, variant)
     target.mkdir(parents=True, exist_ok=True)
-    copied = copy_sources(images, target)
-    click.echo(f"added sources: {', '.join(copied)}")
+    if images:
+        copied = copy_sources(images, target)
+        click.echo(f"added sources: {', '.join(copied)}")
+    else:
+        click.echo("no source paths provided; use the browser upload control")
     run_cropper(target)
     click.echo(f"saved crops in {target}")
 
