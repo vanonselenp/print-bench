@@ -22,6 +22,7 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse as parse_url
 from urllib.parse import unquote, urlparse
 
 import click
@@ -53,9 +54,12 @@ TEMPLATES = Path(__file__).parent.parent / "templates"
 
 MESHY_API_BASE = "https://api.meshy.ai/openapi/v1"
 MESHY_ENDPOINT = f"{MESHY_API_BASE}/multi-image-to-3d"
+HI3D_API_BASE = "https://api.hitem3d.ai/open-api/v1"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom"]
+HI3D_VIEW_ORDER = ["front", "back", "left", "right"]
 TASK_ARCHIVE_RE = re.compile(r"^task\.(\d+)\.json$")
+HI3D_FORMAT_EXTS = {"1": "obj", "2": "glb", "3": "stl", "4": "fbx", "5": "usdz"}
 
 
 def current_context() -> dict[str, str | None]:
@@ -605,6 +609,10 @@ def parse_params(params: tuple[str, ...]) -> dict:
     return parsed
 
 
+def clean_params(params: dict) -> dict[str, str]:
+    return {key: str(value) for key, value in params.items() if value is not None}
+
+
 def ordered_views(target: Path) -> list[tuple[str, Path]]:
     regions = read_json(regions_path(target), {"regions": {}}).get("regions", {})
     labels = set(regions.keys())
@@ -656,6 +664,118 @@ def submit_meshy(target: Path, params: dict) -> dict:
     }
 
 
+def hi3d_access_token() -> str:
+    client_id = os.environ.get("HI3D_CLIENT_ID")
+    client_secret = os.environ.get("HI3D_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        click.echo("error: HI3D_CLIENT_ID and HI3D_CLIENT_SECRET must be set", err=True)
+        click.echo("hint: create credentials at https://platform.hitem3d.ai/console/apiKey", err=True)
+        sys.exit(1)
+
+    encoded = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    headers = {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
+    with httpx.Client(timeout=60) as client:
+        response = client.post(f"{HI3D_API_BASE}/auth/token", headers=headers)
+        if response.status_code >= 300:
+            click.echo(f"Hi3D token failed: {response.status_code} {response.text}", err=True)
+            sys.exit(1)
+        payload = response.json()
+    if payload.get("code") != 200:
+        click.echo(f"Hi3D token failed: {payload}", err=True)
+        sys.exit(1)
+    return payload.get("data", {}).get("accessToken") or ""
+
+
+def hi3d_headers() -> dict[str, str]:
+    token = hi3d_access_token()
+    if not token:
+        click.echo("error: Hi3D token response did not include accessToken", err=True)
+        sys.exit(1)
+    return {"Authorization": f"Bearer {token}", "Accept": "*/*"}
+
+
+def hi3d_ordered_views(target: Path) -> list[tuple[str, Path]]:
+    views = ordered_views(target)
+    known = [(label, path) for label, path in views if label in HI3D_VIEW_ORDER]
+    unknown = [label for label, _ in views if label not in HI3D_VIEW_ORDER]
+    if unknown:
+        click.echo(
+            f"warning: Hi3D only accepts front/back/left/right; dropping {', '.join(unknown)}",
+            err=True,
+        )
+    known.sort(key=lambda item: HI3D_VIEW_ORDER.index(item[0]))
+    return known[:4]
+
+
+def hi3d_multi_images_bit(labels: list[str]) -> str:
+    return "".join("1" if label in labels else "0" for label in HI3D_VIEW_ORDER)
+
+
+def submit_hi3d(target: Path, params: dict) -> dict:
+    views = hi3d_ordered_views(target)
+    if not views:
+        click.echo(f"error: no Hi3D-compatible cropped views found in {target}", err=True)
+        click.echo("hint: crop at least a front view", err=True)
+        sys.exit(1)
+
+    data = {
+        "request_type": "1",
+        "model": "hitem3dv2.1",
+        "resolution": "1536fast",
+        "face": "800000",
+        "format": "3",
+    }
+    data.update(clean_params(params))
+
+    open_files = []
+    try:
+        if len(views) == 1:
+            label, path = views[0]
+            fh = path.open("rb")
+            open_files.append(fh)
+            files = {"images": (path.name, fh, mimetypes.guess_type(path.name)[0] or "image/png")}
+        else:
+            labels = [label for label, _ in views]
+            data["multi_images_bit"] = hi3d_multi_images_bit(labels)
+            files = []
+            for _, path in views:
+                fh = path.open("rb")
+                open_files.append(fh)
+                files.append(("multi_images", (path.name, fh, mimetypes.guess_type(path.name)[0] or "image/png")))
+
+        with httpx.Client(timeout=120) as client:
+            response = client.post(
+                f"{HI3D_API_BASE}/submit-task",
+                headers=hi3d_headers(),
+                data=data,
+                files=files,
+            )
+            if response.status_code >= 300:
+                click.echo(f"Hi3D submit failed: {response.status_code} {response.text}", err=True)
+                sys.exit(1)
+            payload = response.json()
+    finally:
+        for fh in open_files:
+            fh.close()
+
+    if payload.get("code") != 200:
+        click.echo(f"Hi3D submit failed: {payload}", err=True)
+        sys.exit(1)
+    task_id = payload.get("data", {}).get("task_id")
+    if not task_id:
+        click.echo(f"Hi3D submit response missing task_id: {payload}", err=True)
+        sys.exit(1)
+
+    return {
+        "backend": "hi3d",
+        "endpoint": "image-to-3d",
+        "task_id": task_id,
+        "submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "params": data,
+        "views": [label for label, _ in views],
+    }
+
+
 def get_meshy_task(task_id: str) -> dict:
     api_key = os.environ.get("MESHY_API_KEY")
     if not api_key:
@@ -670,6 +790,23 @@ def get_meshy_task(task_id: str) -> dict:
         return response.json()
 
 
+def get_hi3d_task(task_id: str) -> dict:
+    with httpx.Client(timeout=60) as client:
+        response = client.get(
+            f"{HI3D_API_BASE}/query-task",
+            params={"task_id": task_id},
+            headers=hi3d_headers(),
+        )
+        if response.status_code >= 300:
+            click.echo(f"Hi3D status failed: {response.status_code} {response.text}", err=True)
+            sys.exit(1)
+        payload = response.json()
+    if payload.get("code") != 200:
+        click.echo(f"Hi3D status failed: {payload}", err=True)
+        sys.exit(1)
+    return payload.get("data") or {}
+
+
 def download_meshy_model(task: dict) -> bytes:
     urls = task.get("model_urls") or {}
     url = urls.get("stl") or urls.get("glb") or urls.get("fbx")
@@ -682,6 +819,21 @@ def download_meshy_model(task: dict) -> bytes:
         return response.content
 
 
+def download_url(url: str) -> bytes:
+    with httpx.Client(timeout=120) as client:
+        response = client.get(url)
+        response.raise_for_status()
+        return response.content
+
+
+def hi3d_output_filename(stored: dict, url: str) -> str:
+    suffix = Path(parse_url(url).path).suffix.lower().lstrip(".")
+    if suffix:
+        return f"model.{suffix}"
+    fmt = str((stored.get("params") or {}).get("format", "3"))
+    return f"model.{HI3D_FORMAT_EXTS.get(fmt, 'stl')}"
+
+
 def load_task(project: str, subject: str, variant: str) -> tuple[Path, dict]:
     require_project(project)
     find_subject(project, subject)
@@ -692,7 +844,7 @@ def load_task(project: str, subject: str, variant: str) -> tuple[Path, dict]:
         click.echo(f"hint: pb upload {project} {subject} {variant}", err=True)
         sys.exit(1)
     stored = read_json(task_file, {})
-    if stored.get("backend") != "meshy":
+    if stored.get("backend") not in {"meshy", "hi3d"}:
         click.echo(f"error: unsupported backend in task.json: {stored.get('backend')}", err=True)
         sys.exit(1)
     return target, stored
@@ -835,20 +987,21 @@ def upload(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend != "meshy":
-        click.echo("error: only --backend meshy is implemented", err=True)
+    if backend not in {"meshy", "hi3d"}:
+        click.echo("error: --backend must be meshy or hi3d", err=True)
         sys.exit(1)
     target = variant_dir(project, subject, variant)
     if not target.is_dir():
         click.echo(f"error: variant not found: {target}", err=True)
         click.echo(f"hint: pb crop {project} {subject} {variant} <image>", err=True)
         sys.exit(1)
-    result = submit_meshy(target, parse_params(params))
+    parsed_params = parse_params(params)
+    result = submit_hi3d(target, parsed_params) if backend == "hi3d" else submit_meshy(target, parsed_params)
     write_json(task_path(target), result)
-    click.echo(f"submitted {subject}/{variant} to Meshy")
+    click.echo(f"submitted {subject}/{variant} to {backend}")
     click.echo(f"task: {result['task_id']}")
     click.echo(f"views: {', '.join(result['views'])}")
-    click.echo("next: inspect in Meshy/API, then run pb fetch when worth keeping")
+    click.echo("next: inspect status, then run pb fetch when worth keeping")
 
 
 @cli.command()
@@ -860,8 +1013,20 @@ def status(args: tuple[str, ...]) -> None:
         click.echo("error: status does not accept extra arguments", err=True)
         sys.exit(1)
     _, stored = load_task(project, subject, variant)
+    if stored.get("backend") == "hi3d":
+        task = get_hi3d_task(stored["task_id"])
+        click.echo(f"task: {stored['task_id']}")
+        click.echo(f"backend: hi3d")
+        click.echo(f"status: {task.get('state')}")
+        if task.get("cover_url"):
+            click.echo(f"thumbnail: {task['cover_url']}")
+        if task.get("url"):
+            click.echo(f"model: {task['url']}")
+        return
+
     task = get_meshy_task(stored["task_id"])
     click.echo(f"task: {stored['task_id']}")
+    click.echo(f"backend: meshy")
     click.echo(f"status: {task.get('status')} progress={task.get('progress', 0)}%")
     if task.get("thumbnail_url"):
         click.echo(f"thumbnail: {task['thumbnail_url']}")
@@ -888,6 +1053,35 @@ def fetch(wait: bool, poll_interval: int, args: tuple[str, ...]) -> None:
     task_file = task_path(target)
 
     while True:
+        if stored.get("backend") == "hi3d":
+            task = get_hi3d_task(stored["task_id"])
+            state = task.get("state")
+            click.echo(f"status={state}")
+            if task.get("cover_url"):
+                click.echo(f"thumbnail: {task['cover_url']}")
+            if state == "success":
+                url = task.get("url")
+                if not url:
+                    click.echo(f"error: no model URL in response: {task}", err=True)
+                    sys.exit(1)
+                data = download_url(url)
+                filename = hi3d_output_filename(stored, url)
+                out = target / filename
+                out.write_bytes(data)
+                stored["fetched_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                stored["model_file"] = filename
+                write_json(task_file, stored)
+                click.echo(f"saved {out} ({len(data)} bytes)")
+                return
+            if state == "failed":
+                click.echo(f"task failed: {task}", err=True)
+                sys.exit(1)
+            if not wait:
+                click.echo("task not ready; rerun pb fetch later or use --wait", err=True)
+                sys.exit(1)
+            time.sleep(poll_interval)
+            continue
+
         task = get_meshy_task(stored["task_id"])
         status = task.get("status")
         progress = task.get("progress", 0)
@@ -924,14 +1118,15 @@ def retry(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None:
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend != "meshy":
-        click.echo("error: only --backend meshy is implemented", err=True)
+    if backend not in {"meshy", "hi3d"}:
+        click.echo("error: --backend must be meshy or hi3d", err=True)
         sys.exit(1)
     target = variant_dir(project, subject, variant)
     archive_task(target)
-    result = submit_meshy(target, parse_params(params))
+    parsed_params = parse_params(params)
+    result = submit_hi3d(target, parsed_params) if backend == "hi3d" else submit_meshy(target, parsed_params)
     write_json(task_path(target), result)
-    click.echo(f"resubmitted {subject}/{variant} to Meshy")
+    click.echo(f"resubmitted {subject}/{variant} to {backend}")
     click.echo(f"task: {result['task_id']}")
 
 
@@ -950,14 +1145,18 @@ def open_cmd(args: tuple[str, ...]) -> None:
         click.echo(f"error: variant not found: {target}", err=True)
         sys.exit(1)
 
+    stored = read_json(task_path(target), {})
+    model_file = stored.get("model_file")
     candidates = [
+        target / model_file if model_file else None,
         target / "model.stl",
+        target / "model.glb",
         target / "front.png",
         sources_dir(target),
         target,
     ]
     for candidate in candidates:
-        if candidate.exists():
+        if candidate and candidate.exists():
             subprocess.run(["open", str(candidate)], check=False)
             click.echo(f"opened {candidate}")
             return
@@ -1014,11 +1213,13 @@ def list_cmd(project: str | None) -> None:
                     continue
                 views = ordered_views(v)
                 has_task = task_path(v).exists()
-                has_stl = (v / "model.stl").exists()
+                stored = read_json(task_path(v), {})
+                model_file = stored.get("model_file")
+                has_model = (v / "model.stl").exists() or bool(model_file and (v / model_file).exists())
                 has_sources = bool(list_sources(v))
                 flag = (
-                    "stl"
-                    if has_stl
+                    "model"
+                    if has_model
                     else "mesh-pending"
                     if has_task
                     else "cropped"

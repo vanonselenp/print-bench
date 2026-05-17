@@ -38,7 +38,7 @@ explicit fetch -> slicer / print
 Automated:
 
 - Assemble consistent prompts from `style.md` and `subjects.yaml`.
-- Store source images, crop regions, cropped views, Meshy tasks, and models.
+- Store source images, crop regions, cropped views, backend tasks, and models.
 - Upload labelled views to Meshy.
 - Check task status and fetch finished models.
 - Open the best local artifact for review.
@@ -63,15 +63,17 @@ Required:
 - A local web browser for the cropper.
 - An image-generation tool such as ChatGPT, Gemini, Claude, or another UI that
   can produce concept images.
-- A Meshy account and API key for 3D generation.
+- A Meshy API key or Hi3D API credentials for 3D generation.
 
 Optional but useful:
 
 - A 3D viewer such as macOS Preview, Blender, or Windows 3D Viewer.
 - A slicer such as Bambu Studio, OrcaSlicer, Cura, or similar.
 
-Meshy is the only supported 3D backend today. Other backends can be added later,
-but the current implementation targets Meshy's multi-image-to-3D API.
+Supported 3D backends today:
+
+- Meshy multi-image-to-3D.
+- Hi3D image-to-3D / multi-view image-to-3D.
 
 ## Install
 
@@ -113,7 +115,9 @@ Alternatively, keep using `uv run`:
 uv run pb list bolt-british
 ```
 
-## Configure Meshy
+## Configure A 3D Backend
+
+### Meshy
 
 Create an API key from Meshy's API settings page:
 
@@ -144,6 +148,42 @@ pb fetch <subject> <variant>
 
 Meshy also retains API-generated assets for a limited time on non-enterprise
 accounts. Fetch models you want to keep.
+
+### Hi3D
+
+Create API credentials from the Hi3D platform console:
+
+```text
+https://platform.hitem3d.ai/console/apiKey
+```
+
+Set both values in your shell:
+
+```bash
+# macOS / Linux
+export HI3D_CLIENT_ID=...
+export HI3D_CLIENT_SECRET=...
+```
+
+```powershell
+# Windows PowerShell
+$env:HI3D_CLIENT_ID="..."
+$env:HI3D_CLIENT_SECRET="..."
+```
+
+Use Hi3D by selecting the backend:
+
+```bash
+pb upload hq-lieutenant v1 --backend hi3d
+pb status hq-lieutenant v1
+pb fetch hq-lieutenant v1
+```
+
+Hi3D supports up to four multi-view images in this order: `front`, `back`,
+`left`, `right`. Other local crop labels are ignored for Hi3D upload. The
+default Hi3D parameters are chosen for printable output: geometry-only,
+`hitem3dv2.1`, `1536fast`, and STL format. Override backend parameters with
+repeated `--param key=value` flags.
 
 ## Create A Project
 
@@ -206,6 +246,12 @@ Check progress:
 
 ```bash
 pb status hq-lieutenant v1
+```
+
+To use Hi3D instead:
+
+```bash
+pb upload hq-lieutenant v1 --backend hi3d
 ```
 
 When the result is worth keeping, fetch it:
@@ -320,10 +366,12 @@ Important files:
 - `sources/`: original images from the image-generation tool.
 - `regions.json`: labelled crop boxes, so cropping is repeatable.
 - `front.png`, `back.png`, etc.: extracted views sent to Meshy.
-- `task.json`: Meshy task id and upload metadata.
-- `model.stl`: downloaded only after `pb fetch`.
+- `task.json`: backend task id and upload metadata.
+- `model.stl`: downloaded only after `pb fetch` when the backend output is STL.
 
-## Meshy Notes
+## Backend Notes
+
+### Meshy
 
 Meshy's multi-image endpoint accepts one to four images as an ordered array,
 not labelled views. `pb` keeps labels locally and uploads them in this order:
@@ -342,6 +390,21 @@ pb status hq-lieutenant v1
 
 It prints the Meshy task status, progress, thumbnail URL when available, and
 model URLs when available.
+
+### Hi3D
+
+Hi3D uses a token flow based on `HI3D_CLIENT_ID` and `HI3D_CLIENT_SECRET`.
+`pb` obtains a short-lived token for each API interaction.
+
+Hi3D accepts either one image or up to four ordered multi-view images:
+
+```text
+front, back, left, right
+```
+
+The API returns a temporary model URL when the task succeeds. `pb fetch`
+downloads that URL into the variant folder and records the local filename in
+`task.json`.
 
 ## Troubleshooting
 
@@ -367,6 +430,15 @@ On Windows PowerShell:
 
 ```powershell
 $env:MESHY_API_KEY="msy-..."
+```
+
+`HI3D_CLIENT_ID and HI3D_CLIENT_SECRET must be set`
+
+Create credentials in the Hi3D platform console, then set both variables:
+
+```bash
+export HI3D_CLIENT_ID=...
+export HI3D_CLIENT_SECRET=...
 ```
 
 Model exists over the API but not on the Meshy site
@@ -402,7 +474,9 @@ pb fetch hq-lieutenant v1 --wait
 No `model.stl`
 
 The model is only downloaded after `pb fetch`. `pb upload` intentionally does
-not download anything.
+not download anything. Hi3D can return other formats if you override
+`--param format=...`; `pb open` uses the fetched filename recorded in
+`task.json`.
 
 ## Command Reference
 
@@ -413,9 +487,9 @@ not download anything.
 | `pb prompt [project] [subject]` | Copy the assembled prompt to the clipboard. |
 | `pb crop [project] [subject] <variant>` | Open the browser cropper and add source images. |
 | `pb recrop [project] [subject] <variant>` | Reopen the cropper for existing sources. |
-| `pb upload [project] [subject] <variant>` | Submit cropped views to Meshy and write `task.json`. |
-| `pb status [project] [subject] <variant>` | Print Meshy task status and URLs. |
-| `pb fetch [project] [subject] <variant>` | Download `model.stl` when the task is complete. |
+| `pb upload [project] [subject] <variant>` | Submit cropped views to the selected backend and write `task.json`. |
+| `pb status [project] [subject] <variant>` | Print backend task status and URLs. |
+| `pb fetch [project] [subject] <variant>` | Download the backend model when the task is complete. |
 | `pb retry [project] [subject] <variant>` | Archive the previous task and resubmit the same crops. |
 | `pb open [project] [subject] <variant>` | Open the best local artifact for review. |
 | `pb learn [project] "<lesson>"` | Append a dated lesson to `style.md`. |
