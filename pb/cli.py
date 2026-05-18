@@ -602,6 +602,10 @@ def parse_param(value: str):
     try:
         return int(value)
     except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
         return value
 
 
@@ -807,7 +811,19 @@ def replicate_ordered_views(target: Path) -> list[tuple[str, Path]]:
     return filtered_views(target, REPLICATE_VIEW_ORDER, "Replicate Rodin uses front/back/left/right/top")
 
 
-def build_replicate_input(target: Path, params: dict) -> tuple[dict, list[str]]:
+def replicate_hunyuan_views(target: Path) -> list[tuple[str, Path]]:
+    return filtered_views(target, HI3D_VIEW_ORDER, "Hunyuan3D-2mv only accepts front/back/left/right")
+
+
+def warn_large_replicate_input(path: Path) -> None:
+    if path.stat().st_size > 1_000_000:
+        click.echo(
+            f"warning: {path.name} is over 1MB; Replicate recommends hosted files for large inputs",
+            err=True,
+        )
+
+
+def build_replicate_rodin_input(target: Path, params: dict) -> tuple[dict, list[str]]:
     views = replicate_ordered_views(target)
     if not views:
         click.echo(f"error: no cropped view PNGs found in {target}", err=True)
@@ -816,11 +832,7 @@ def build_replicate_input(target: Path, params: dict) -> tuple[dict, list[str]]:
 
     images = []
     for _, path in views:
-        if path.stat().st_size > 1_000_000:
-            click.echo(
-                f"warning: {path.name} is over 1MB; Replicate recommends hosted files for large inputs",
-                err=True,
-            )
+        warn_large_replicate_input(path)
         images.append(to_data_uri(path))
 
     input_payload = {
@@ -833,10 +845,49 @@ def build_replicate_input(target: Path, params: dict) -> tuple[dict, list[str]]:
     return input_payload, [label for label, _ in views]
 
 
+def build_replicate_hunyuan2mv_input(target: Path, params: dict) -> tuple[dict, list[str]]:
+    views = replicate_hunyuan_views(target)
+    by_label = {label: path for label, path in views}
+    if "front" not in by_label:
+        click.echo(f"error: Hunyuan3D-2mv requires front.png in {target}", err=True)
+        click.echo("hint: crop a front view first", err=True)
+        sys.exit(1)
+
+    input_payload = {
+        "file_type": "stl",
+        "steps": 30,
+        "guidance_scale": 5.0,
+        "seed": 1234,
+        "octree_resolution": 256,
+        "remove_background": True,
+        "num_chunks": 200000,
+        "randomize_seed": True,
+        "target_face_num": 10000,
+    }
+    for label in HI3D_VIEW_ORDER:
+        path = by_label.get(label)
+        if path:
+            warn_large_replicate_input(path)
+            input_payload[f"{label}_image"] = to_data_uri(path)
+    input_payload.update(params)
+    return input_payload, [label for label, _ in views]
+
+
+def build_replicate_input(model: str, target: Path, params: dict) -> tuple[dict, list[str]]:
+    if model == "tencent/hunyuan3d-2mv":
+        return build_replicate_hunyuan2mv_input(target, params)
+    return build_replicate_rodin_input(target, params)
+
+
+def replicate_version(model: str) -> str:
+    return REPLICATE_MODEL_VERSIONS.get(model, model)
+
+
 def submit_replicate(target: Path, params: dict) -> dict:
     model = str(params.pop("model", REPLICATE_DEFAULT_MODEL))
-    input_payload, labels = build_replicate_input(target, params)
-    payload = {"version": model, "input": input_payload}
+    input_payload, labels = build_replicate_input(model, target, params)
+    version = replicate_version(model)
+    payload = {"version": version, "input": input_payload}
 
     with httpx.Client(timeout=60) as client:
         response = client.post(
@@ -860,6 +911,7 @@ def submit_replicate(target: Path, params: dict) -> dict:
         "task_id": prediction_id,
         "submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "model": model,
+        "version": version,
         "params": input_payload,
         "views": labels,
         "urls": prediction.get("urls") or {},

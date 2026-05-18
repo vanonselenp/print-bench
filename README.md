@@ -217,9 +217,15 @@ pb fetch hq-lieutenant v1
 The default Replicate model is `hyper3d/rodin`, using `front`, `back`, `left`,
 `right`, and `top` crops when present. The default output request is STL via
 `geometry_file_format=stl`, with a generic prompt describing a printable model
-from the reference images. Override Replicate inputs with repeated `--param
-key=value` flags, including `--param prompt=...` or `--param
-model=<owner>/<model>` when you want to try a different Replicate model.
+from the reference images.
+
+`pb` also has an explicit mapper for `tencent/hunyuan3d-2mv`, which uses
+`front_image`, `back_image`, `left_image`, and `right_image` inputs. It requires
+`front.png` and defaults to `file_type=stl`.
+
+Override Replicate inputs with repeated `--param key=value` flags, including
+`--param prompt=...` for Rodin or `--param model=<owner>/<model>` when you want
+to try a supported Replicate model.
 
 ## Create A Project
 
@@ -458,6 +464,15 @@ The first supported mapping targets `hyper3d/rodin`, because it accepts
 multi-view image inputs and can return STL. `pb` sends data URI inputs from the
 local crop PNGs. Replicate recommends hosted files for larger inputs, so very
 large crops may need resizing or a future hosted-file upload path.
+
+The `tencent/hunyuan3d-2mv` mapping is designed for labelled multi-view crops:
+
+```bash
+pb upload hq-lieutenant v1 --backend replicate --param model=tencent/hunyuan3d-2mv
+```
+
+It uses the published Replicate version id for that community model, because
+community models require a specific version rather than just `owner/model`.
 
 Replicate API prediction input and output data is retained for a limited time by
 default. Fetch outputs you want to keep.
