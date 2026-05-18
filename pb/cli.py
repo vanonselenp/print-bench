@@ -22,7 +22,6 @@ import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse as parse_url
 from urllib.parse import unquote, urlparse
 
 import click
@@ -65,6 +64,9 @@ HI3D_FORMAT_EXTS = {"1": "obj", "2": "glb", "3": "stl", "4": "fbx", "5": "usdz"}
 SUPPORTED_BACKENDS = {"meshy", "hi3d", "replicate"}
 MODEL_EXTS = {"stl", "glb", "obj", "fbx", "usdz", "3mf", "zip"}
 REPLICATE_DEFAULT_MODEL = "hyper3d/rodin"
+REPLICATE_MODEL_VERSIONS = {
+    "tencent/hunyuan3d-2mv": "tencent/hunyuan3d-2mv:71798fbc3c9f7b7097e3bb85496e5a797d8b8f616b550692e7c3e176a8e9e5db",
+}
 
 
 def current_context() -> dict[str, str | None]:
@@ -669,7 +671,13 @@ def submit_meshy(target: Path, params: dict) -> dict:
     }
 
 
+_HI3D_TOKEN: str | None = None
+
+
 def hi3d_access_token() -> str:
+    global _HI3D_TOKEN
+    if _HI3D_TOKEN:
+        return _HI3D_TOKEN
     client_id = os.environ.get("HI3D_CLIENT_ID")
     client_secret = os.environ.get("HI3D_CLIENT_SECRET")
     if not client_id or not client_secret:
@@ -688,7 +696,8 @@ def hi3d_access_token() -> str:
     if payload.get("code") != 200:
         click.echo(f"Hi3D token failed: {payload}", err=True)
         sys.exit(1)
-    return payload.get("data", {}).get("accessToken") or ""
+    _HI3D_TOKEN = payload.get("data", {}).get("accessToken") or ""
+    return _HI3D_TOKEN
 
 
 def hi3d_headers() -> dict[str, str]:
@@ -699,17 +708,18 @@ def hi3d_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "*/*"}
 
 
-def hi3d_ordered_views(target: Path) -> list[tuple[str, Path]]:
+def filtered_views(target: Path, allowed: list[str], drop_msg: str) -> list[tuple[str, Path]]:
     views = ordered_views(target)
-    known = [(label, path) for label, path in views if label in HI3D_VIEW_ORDER]
-    unknown = [label for label, _ in views if label not in HI3D_VIEW_ORDER]
+    known = [(label, path) for label, path in views if label in allowed]
+    unknown = [label for label, _ in views if label not in allowed]
     if unknown:
-        click.echo(
-            f"warning: Hi3D only accepts front/back/left/right; dropping {', '.join(unknown)}",
-            err=True,
-        )
-    known.sort(key=lambda item: HI3D_VIEW_ORDER.index(item[0]))
-    return known[:4]
+        click.echo(f"warning: {drop_msg}; dropping {', '.join(unknown)}", err=True)
+    known.sort(key=lambda item: allowed.index(item[0]))
+    return known
+
+
+def hi3d_ordered_views(target: Path) -> list[tuple[str, Path]]:
+    return filtered_views(target, HI3D_VIEW_ORDER, "Hi3D only accepts front/back/left/right")
 
 
 def hi3d_multi_images_bit(labels: list[str]) -> str:
@@ -794,22 +804,10 @@ def replicate_headers(content_type: str | None = "application/json") -> dict[str
 
 
 def replicate_ordered_views(target: Path) -> list[tuple[str, Path]]:
-    views = ordered_views(target)
-    known = [(label, path) for label, path in views if label in REPLICATE_VIEW_ORDER]
-    unknown = [label for label, _ in views if label not in REPLICATE_VIEW_ORDER]
-    if unknown:
-        click.echo(
-            f"warning: Replicate Rodin uses front/back/left/right/top; dropping {', '.join(unknown)}",
-            err=True,
-        )
-    known.sort(key=lambda item: REPLICATE_VIEW_ORDER.index(item[0]))
-    if len(known) > 5:
-        dropped = ", ".join(label for label, _ in known[5:])
-        click.echo(f"warning: Replicate Rodin accepts at most 5 images; dropping {dropped}", err=True)
-    return known[:5]
+    return filtered_views(target, REPLICATE_VIEW_ORDER, "Replicate Rodin uses front/back/left/right/top")
 
 
-def build_replicate_input(target: Path, model: str, params: dict) -> tuple[dict, list[str]]:
+def build_replicate_input(target: Path, params: dict) -> tuple[dict, list[str]]:
     views = replicate_ordered_views(target)
     if not views:
         click.echo(f"error: no cropped view PNGs found in {target}", err=True)
@@ -837,7 +835,7 @@ def build_replicate_input(target: Path, model: str, params: dict) -> tuple[dict,
 
 def submit_replicate(target: Path, params: dict) -> dict:
     model = str(params.pop("model", REPLICATE_DEFAULT_MODEL))
-    input_payload, labels = build_replicate_input(target, model, params)
+    input_payload, labels = build_replicate_input(target, params)
     payload = {"version": model, "input": input_payload}
 
     with httpx.Client(timeout=60) as client:
@@ -923,23 +921,16 @@ def download_meshy_model(task: dict) -> bytes:
         return response.content
 
 
-def download_url(url: str) -> bytes:
+def download_url(url: str, headers: dict[str, str] | None = None) -> bytes:
     with httpx.Client(timeout=120) as client:
-        response = client.get(url)
-        response.raise_for_status()
-        return response.content
-
-
-def download_replicate_url(url: str) -> bytes:
-    with httpx.Client(timeout=120) as client:
-        response = client.get(url, headers=replicate_headers(content_type=None))
+        response = client.get(url, headers=headers or {})
         response.raise_for_status()
         return response.content
 
 
 def iter_output_urls(value) -> list[str]:
     if isinstance(value, str):
-        return [value] if value.startswith("http://") or value.startswith("https://") else []
+        return [value] if value.startswith(("http://", "https://")) else []
     if isinstance(value, list):
         urls = []
         for item in value:
@@ -953,8 +944,12 @@ def iter_output_urls(value) -> list[str]:
     return []
 
 
+def url_path_suffix(url: str) -> str:
+    return Path(urlparse(url).path).suffix.lower().lstrip(".")
+
+
 def model_url_extension(url: str) -> str | None:
-    suffix = Path(parse_url(url).path).suffix.lower().lstrip(".")
+    suffix = url_path_suffix(url)
     return suffix if suffix in MODEL_EXTS else None
 
 
@@ -964,15 +959,13 @@ def select_replicate_model_url(output) -> tuple[str, str]:
         if ext := model_url_extension(url):
             return url, ext
     if urls:
-        url = urls[0]
-        return url, model_url_extension(url) or "bin"
+        return urls[0], "bin"
     click.echo(f"error: no downloadable URLs in Replicate output: {output}", err=True)
     sys.exit(1)
 
 
 def hi3d_output_filename(stored: dict, url: str) -> str:
-    suffix = Path(parse_url(url).path).suffix.lower().lstrip(".")
-    if suffix:
+    if suffix := url_path_suffix(url):
         return f"model.{suffix}"
     fmt = str((stored.get("params") or {}).get("format", "3"))
     return f"model.{HI3D_FORMAT_EXTS.get(fmt, 'stl')}"
@@ -1007,15 +1000,23 @@ def archive_task(target: Path) -> None:
     current.rename(target / f"task.{next_num}.json")
 
 
+BACKEND_SUBMITTERS = {
+    "meshy": submit_meshy,
+    "hi3d": submit_hi3d,
+    "replicate": submit_replicate,
+}
+
+
+def require_backend(backend: str) -> None:
+    if backend not in SUPPORTED_BACKENDS:
+        valid = ", ".join(sorted(SUPPORTED_BACKENDS))
+        click.echo(f"error: --backend must be one of {valid}", err=True)
+        sys.exit(1)
+
+
 def submit_backend(backend: str, target: Path, params: dict) -> dict:
-    if backend == "meshy":
-        return submit_meshy(target, params)
-    if backend == "hi3d":
-        return submit_hi3d(target, params)
-    if backend == "replicate":
-        return submit_replicate(target, params)
-    click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
-    sys.exit(1)
+    require_backend(backend)
+    return BACKEND_SUBMITTERS[backend](target, params)
 
 
 @click.group()
@@ -1142,9 +1143,7 @@ def upload(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend not in SUPPORTED_BACKENDS:
-        click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
-        sys.exit(1)
+    require_backend(backend)
     target = variant_dir(project, subject, variant)
     if not target.is_dir():
         click.echo(f"error: variant not found: {target}", err=True)
@@ -1231,7 +1230,7 @@ def fetch(wait: bool, poll_interval: int, args: tuple[str, ...]) -> None:
                 click.echo(f"web: {web_url}")
             if status == "succeeded":
                 url, ext = select_replicate_model_url(prediction.get("output"))
-                data = download_replicate_url(url)
+                data = download_url(url, headers=replicate_headers(content_type=None))
                 filename = f"model.{ext}"
                 out = target / filename
                 out.write_bytes(data)
@@ -1315,9 +1314,7 @@ def retry(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None:
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend not in SUPPORTED_BACKENDS:
-        click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
-        sys.exit(1)
+    require_backend(backend)
     target = variant_dir(project, subject, variant)
     archive_task(target)
     parsed_params = parse_params(params)
@@ -1344,8 +1341,10 @@ def open_cmd(args: tuple[str, ...]) -> None:
 
     stored = read_json(task_path(target), {})
     model_file = stored.get("model_file")
-    candidates = [
-        target / model_file if model_file else None,
+    candidates: list[Path] = []
+    if model_file:
+        candidates.append(target / model_file)
+    candidates += [
         target / "model.stl",
         target / "model.glb",
         target / "front.png",
@@ -1353,7 +1352,7 @@ def open_cmd(args: tuple[str, ...]) -> None:
         target,
     ]
     for candidate in candidates:
-        if candidate and candidate.exists():
+        if candidate.exists():
             subprocess.run(["open", str(candidate)], check=False)
             click.echo(f"opened {candidate}")
             return
@@ -1409,8 +1408,8 @@ def list_cmd(project: str | None) -> None:
                 if not v.is_dir():
                     continue
                 views = ordered_views(v)
-                has_task = task_path(v).exists()
                 stored = read_json(task_path(v), {})
+                has_task = bool(stored)
                 model_file = stored.get("model_file")
                 has_model = (v / "model.stl").exists() or bool(model_file and (v / model_file).exists())
                 has_sources = bool(list_sources(v))
