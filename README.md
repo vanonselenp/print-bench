@@ -216,9 +216,10 @@ pb fetch hq-lieutenant v1
 
 The default Replicate model is `hyper3d/rodin`, using `front`, `back`, `left`,
 `right`, and `top` crops when present. The default output request is STL via
-`geometry_file_format=stl`. Override Replicate inputs with repeated
-`--param key=value` flags, including `--param model=<owner>/<model>` when you
-want to try a different Replicate model.
+`geometry_file_format=stl`, with a generic prompt describing a printable model
+from the reference images. Override Replicate inputs with repeated `--param
+key=value` flags, including `--param prompt=...` or `--param
+model=<owner>/<model>` when you want to try a different Replicate model.
 
 ## Create A Project
 

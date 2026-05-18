@@ -826,6 +826,7 @@ def build_replicate_input(target: Path, model: str, params: dict) -> tuple[dict,
         images.append(to_data_uri(path))
 
     input_payload = {
+        "prompt": "A 3D printable model of the object shown in the reference images.",
         "images": images,
         "geometry_file_format": "stl",
         "quality": "medium",
