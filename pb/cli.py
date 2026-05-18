@@ -55,11 +55,16 @@ TEMPLATES = Path(__file__).parent.parent / "templates"
 MESHY_API_BASE = "https://api.meshy.ai/openapi/v1"
 MESHY_ENDPOINT = f"{MESHY_API_BASE}/multi-image-to-3d"
 HI3D_API_BASE = "https://api.hitem3d.ai/open-api/v1"
+REPLICATE_API_BASE = "https://api.replicate.com/v1"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg"}
 VIEW_ORDER = ["front", "back", "left", "right", "top", "bottom"]
 HI3D_VIEW_ORDER = ["front", "back", "left", "right"]
+REPLICATE_VIEW_ORDER = ["front", "back", "left", "right", "top"]
 TASK_ARCHIVE_RE = re.compile(r"^task\.(\d+)\.json$")
 HI3D_FORMAT_EXTS = {"1": "obj", "2": "glb", "3": "stl", "4": "fbx", "5": "usdz"}
+SUPPORTED_BACKENDS = {"meshy", "hi3d", "replicate"}
+MODEL_EXTS = {"stl", "glb", "obj", "fbx", "usdz", "3mf", "zip"}
+REPLICATE_DEFAULT_MODEL = "hyper3d/rodin"
 
 
 def current_context() -> dict[str, str | None]:
@@ -776,6 +781,92 @@ def submit_hi3d(target: Path, params: dict) -> dict:
     }
 
 
+def replicate_headers(content_type: str | None = "application/json") -> dict[str, str]:
+    token = os.environ.get("REPLICATE_API_TOKEN")
+    if not token:
+        click.echo("error: REPLICATE_API_TOKEN not set in environment", err=True)
+        click.echo("hint: create a token at https://replicate.com/account/api-tokens", err=True)
+        sys.exit(1)
+    headers = {"Authorization": f"Bearer {token}"}
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def replicate_ordered_views(target: Path) -> list[tuple[str, Path]]:
+    views = ordered_views(target)
+    known = [(label, path) for label, path in views if label in REPLICATE_VIEW_ORDER]
+    unknown = [label for label, _ in views if label not in REPLICATE_VIEW_ORDER]
+    if unknown:
+        click.echo(
+            f"warning: Replicate Rodin uses front/back/left/right/top; dropping {', '.join(unknown)}",
+            err=True,
+        )
+    known.sort(key=lambda item: REPLICATE_VIEW_ORDER.index(item[0]))
+    if len(known) > 5:
+        dropped = ", ".join(label for label, _ in known[5:])
+        click.echo(f"warning: Replicate Rodin accepts at most 5 images; dropping {dropped}", err=True)
+    return known[:5]
+
+
+def build_replicate_input(target: Path, model: str, params: dict) -> tuple[dict, list[str]]:
+    views = replicate_ordered_views(target)
+    if not views:
+        click.echo(f"error: no cropped view PNGs found in {target}", err=True)
+        click.echo("hint: run pb crop first", err=True)
+        sys.exit(1)
+
+    images = []
+    for _, path in views:
+        if path.stat().st_size > 1_000_000:
+            click.echo(
+                f"warning: {path.name} is over 1MB; Replicate recommends hosted files for large inputs",
+                err=True,
+            )
+        images.append(to_data_uri(path))
+
+    input_payload = {
+        "images": images,
+        "geometry_file_format": "stl",
+        "quality": "medium",
+    }
+    input_payload.update(params)
+    return input_payload, [label for label, _ in views]
+
+
+def submit_replicate(target: Path, params: dict) -> dict:
+    model = str(params.pop("model", REPLICATE_DEFAULT_MODEL))
+    input_payload, labels = build_replicate_input(target, model, params)
+    payload = {"version": model, "input": input_payload}
+
+    with httpx.Client(timeout=60) as client:
+        response = client.post(
+            f"{REPLICATE_API_BASE}/predictions",
+            headers=replicate_headers(),
+            json=payload,
+        )
+        if response.status_code >= 300:
+            click.echo(f"Replicate submit failed: {response.status_code} {response.text}", err=True)
+            sys.exit(1)
+        prediction = response.json()
+
+    prediction_id = prediction.get("id")
+    if not prediction_id:
+        click.echo(f"Replicate submit response missing id: {prediction}", err=True)
+        sys.exit(1)
+
+    return {
+        "backend": "replicate",
+        "endpoint": "predictions",
+        "task_id": prediction_id,
+        "submitted_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "model": model,
+        "params": input_payload,
+        "views": labels,
+        "urls": prediction.get("urls") or {},
+    }
+
+
 def get_meshy_task(task_id: str) -> dict:
     api_key = os.environ.get("MESHY_API_KEY")
     if not api_key:
@@ -807,6 +898,18 @@ def get_hi3d_task(task_id: str) -> dict:
     return payload.get("data") or {}
 
 
+def get_replicate_prediction(task_id: str) -> dict:
+    with httpx.Client(timeout=60) as client:
+        response = client.get(
+            f"{REPLICATE_API_BASE}/predictions/{task_id}",
+            headers=replicate_headers(content_type=None),
+        )
+        if response.status_code >= 300:
+            click.echo(f"Replicate status failed: {response.status_code} {response.text}", err=True)
+            sys.exit(1)
+        return response.json()
+
+
 def download_meshy_model(task: dict) -> bytes:
     urls = task.get("model_urls") or {}
     url = urls.get("stl") or urls.get("glb") or urls.get("fbx")
@@ -824,6 +927,46 @@ def download_url(url: str) -> bytes:
         response = client.get(url)
         response.raise_for_status()
         return response.content
+
+
+def download_replicate_url(url: str) -> bytes:
+    with httpx.Client(timeout=120) as client:
+        response = client.get(url, headers=replicate_headers(content_type=None))
+        response.raise_for_status()
+        return response.content
+
+
+def iter_output_urls(value) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.startswith("http://") or value.startswith("https://") else []
+    if isinstance(value, list):
+        urls = []
+        for item in value:
+            urls.extend(iter_output_urls(item))
+        return urls
+    if isinstance(value, dict):
+        urls = []
+        for item in value.values():
+            urls.extend(iter_output_urls(item))
+        return urls
+    return []
+
+
+def model_url_extension(url: str) -> str | None:
+    suffix = Path(parse_url(url).path).suffix.lower().lstrip(".")
+    return suffix if suffix in MODEL_EXTS else None
+
+
+def select_replicate_model_url(output) -> tuple[str, str]:
+    urls = iter_output_urls(output)
+    for url in urls:
+        if ext := model_url_extension(url):
+            return url, ext
+    if urls:
+        url = urls[0]
+        return url, model_url_extension(url) or "bin"
+    click.echo(f"error: no downloadable URLs in Replicate output: {output}", err=True)
+    sys.exit(1)
 
 
 def hi3d_output_filename(stored: dict, url: str) -> str:
@@ -844,7 +987,7 @@ def load_task(project: str, subject: str, variant: str) -> tuple[Path, dict]:
         click.echo(f"hint: pb upload {project} {subject} {variant}", err=True)
         sys.exit(1)
     stored = read_json(task_file, {})
-    if stored.get("backend") not in {"meshy", "hi3d"}:
+    if stored.get("backend") not in SUPPORTED_BACKENDS:
         click.echo(f"error: unsupported backend in task.json: {stored.get('backend')}", err=True)
         sys.exit(1)
     return target, stored
@@ -861,6 +1004,17 @@ def archive_task(target: Path) -> None:
     ]
     next_num = max(numbers, default=0) + 1
     current.rename(target / f"task.{next_num}.json")
+
+
+def submit_backend(backend: str, target: Path, params: dict) -> dict:
+    if backend == "meshy":
+        return submit_meshy(target, params)
+    if backend == "hi3d":
+        return submit_hi3d(target, params)
+    if backend == "replicate":
+        return submit_replicate(target, params)
+    click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
+    sys.exit(1)
 
 
 @click.group()
@@ -987,8 +1141,8 @@ def upload(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend not in {"meshy", "hi3d"}:
-        click.echo("error: --backend must be meshy or hi3d", err=True)
+    if backend not in SUPPORTED_BACKENDS:
+        click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
         sys.exit(1)
     target = variant_dir(project, subject, variant)
     if not target.is_dir():
@@ -996,7 +1150,7 @@ def upload(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None
         click.echo(f"hint: pb crop {project} {subject} {variant} <image>", err=True)
         sys.exit(1)
     parsed_params = parse_params(params)
-    result = submit_hi3d(target, parsed_params) if backend == "hi3d" else submit_meshy(target, parsed_params)
+    result = submit_backend(backend, target, parsed_params)
     write_json(task_path(target), result)
     click.echo(f"submitted {subject}/{variant} to {backend}")
     click.echo(f"task: {result['task_id']}")
@@ -1013,6 +1167,21 @@ def status(args: tuple[str, ...]) -> None:
         click.echo("error: status does not accept extra arguments", err=True)
         sys.exit(1)
     _, stored = load_task(project, subject, variant)
+    if stored.get("backend") == "replicate":
+        prediction = get_replicate_prediction(stored["task_id"])
+        click.echo(f"task: {stored['task_id']}")
+        click.echo("backend: replicate")
+        if stored.get("model"):
+            click.echo(f"model: {stored['model']}")
+        click.echo(f"status: {prediction.get('status')}")
+        if web_url := (prediction.get("urls") or {}).get("web"):
+            click.echo(f"web: {web_url}")
+        if prediction.get("error"):
+            click.echo(f"error: {prediction['error']}", err=True)
+        for url in iter_output_urls(prediction.get("output")):
+            click.echo(f"output: {url}")
+        return
+
     if stored.get("backend") == "hi3d":
         task = get_hi3d_task(stored["task_id"])
         click.echo(f"task: {stored['task_id']}")
@@ -1044,7 +1213,7 @@ def status(args: tuple[str, ...]) -> None:
 @click.option("--poll-interval", default=10, show_default=True)
 @click.argument("args", nargs=-1)
 def fetch(wait: bool, poll_interval: int, args: tuple[str, ...]) -> None:
-    """Fetch model.stl for a completed task. Only downloads when run explicitly."""
+    """Fetch a model for a completed task. Only downloads when run explicitly."""
     project, subject, variant, extra = resolve_variant_args(args, "fetch")
     if extra:
         click.echo("error: fetch does not accept extra arguments", err=True)
@@ -1053,6 +1222,33 @@ def fetch(wait: bool, poll_interval: int, args: tuple[str, ...]) -> None:
     task_file = task_path(target)
 
     while True:
+        if stored.get("backend") == "replicate":
+            prediction = get_replicate_prediction(stored["task_id"])
+            status = prediction.get("status")
+            click.echo(f"status={status}")
+            if web_url := (prediction.get("urls") or {}).get("web"):
+                click.echo(f"web: {web_url}")
+            if status == "succeeded":
+                url, ext = select_replicate_model_url(prediction.get("output"))
+                data = download_replicate_url(url)
+                filename = f"model.{ext}"
+                out = target / filename
+                out.write_bytes(data)
+                stored["fetched_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                stored["model_file"] = filename
+                stored["model_url"] = url
+                write_json(task_file, stored)
+                click.echo(f"saved {out} ({len(data)} bytes)")
+                return
+            if status in {"failed", "canceled"}:
+                click.echo(f"task ended in {status}: {prediction.get('error')}", err=True)
+                sys.exit(1)
+            if not wait:
+                click.echo("task not ready; rerun pb fetch later or use --wait", err=True)
+                sys.exit(1)
+            time.sleep(poll_interval)
+            continue
+
         if stored.get("backend") == "hi3d":
             task = get_hi3d_task(stored["task_id"])
             state = task.get("state")
@@ -1118,13 +1314,13 @@ def retry(backend: str, params: tuple[str, ...], args: tuple[str, ...]) -> None:
         sys.exit(1)
     require_project(project)
     find_subject(project, subject)
-    if backend not in {"meshy", "hi3d"}:
-        click.echo("error: --backend must be meshy or hi3d", err=True)
+    if backend not in SUPPORTED_BACKENDS:
+        click.echo("error: --backend must be meshy, hi3d, or replicate", err=True)
         sys.exit(1)
     target = variant_dir(project, subject, variant)
     archive_task(target)
     parsed_params = parse_params(params)
-    result = submit_hi3d(target, parsed_params) if backend == "hi3d" else submit_meshy(target, parsed_params)
+    result = submit_backend(backend, target, parsed_params)
     write_json(task_path(target), result)
     click.echo(f"resubmitted {subject}/{variant} to {backend}")
     click.echo(f"task: {result['task_id']}")

@@ -2,7 +2,7 @@
 
 `pb` is a human-in-the-loop workflow for turning consistent AI-generated
 concept images into local 3D-printable assets. It automates the mechanical
-parts: prompt assembly, file organization, crop extraction, Meshy upload,
+parts: prompt assembly, file organization, crop extraction, backend upload,
 task status, and model retrieval. It deliberately leaves the judgement calls
 with the human.
 
@@ -19,7 +19,7 @@ The friction shows up quickly:
 - The shared style prompt gets repeated with one subject line changed.
 - Generated images get trapped inside ChatGPT, Gemini, or Claude threads.
 - Screenshots, downloads, crop regions, and uploads become manual busywork.
-- Meshy can produce several plausible results, but deciding whether a mesh is
+- Backends can produce several plausible results, but deciding whether a mesh is
   good enough is still a human judgement.
 - Lessons learned from bad outputs need to feed back into the next prompt.
 
@@ -31,7 +31,7 @@ between those judgement points.
 
 ```text
 style guide -> subject -> generated images -> human selection ->
-labelled crops -> Meshy upload -> human mesh judgement ->
+labelled crops -> backend upload -> human mesh judgement ->
 explicit fetch -> slicer / print
 ```
 
@@ -39,7 +39,7 @@ Automated:
 
 - Assemble consistent prompts from `style.md` and `subjects.yaml`.
 - Store source images, crop regions, cropped views, backend tasks, and models.
-- Upload labelled views to Meshy.
+- Upload labelled views to a 3D backend.
 - Check task status and fetch finished models.
 - Open the best local artifact for review.
 
@@ -50,7 +50,7 @@ Human-controlled:
 - Prompt iteration inside the image model.
 - Which generated image to keep.
 - Where the front/back/top crop boundaries are.
-- Whether the Meshy output is worth keeping.
+- Whether the generated mesh is worth keeping.
 - What lessons should be recorded.
 
 ## Requirements
@@ -63,7 +63,7 @@ Required:
 - A local web browser for the cropper.
 - An image-generation tool such as ChatGPT, Gemini, Claude, or another UI that
   can produce concept images.
-- A Meshy API key or Hi3D API credentials for 3D generation.
+- A Meshy API key, Hi3D API credentials, or Replicate API token for 3D generation.
 
 Optional but useful:
 
@@ -74,6 +74,7 @@ Supported 3D backends today:
 
 - Meshy multi-image-to-3D.
 - Hi3D image-to-3D / multi-view image-to-3D.
+- Replicate predictions, currently mapped for `hyper3d/rodin`.
 
 ## Install
 
@@ -185,6 +186,40 @@ default Hi3D parameters are chosen for printable output: geometry-only,
 `hitem3dv2.1`, `1536fast`, and STL format. Override backend parameters with
 repeated `--param key=value` flags.
 
+### Replicate
+
+Create an API token from Replicate:
+
+```text
+https://replicate.com/account/api-tokens
+```
+
+Set it in your shell:
+
+```bash
+# macOS / Linux
+export REPLICATE_API_TOKEN=r8_...
+```
+
+```powershell
+# Windows PowerShell
+$env:REPLICATE_API_TOKEN="r8_..."
+```
+
+Use Replicate by selecting the backend:
+
+```bash
+pb upload hq-lieutenant v1 --backend replicate
+pb status hq-lieutenant v1
+pb fetch hq-lieutenant v1
+```
+
+The default Replicate model is `hyper3d/rodin`, using `front`, `back`, `left`,
+`right`, and `top` crops when present. The default output request is STL via
+`geometry_file_format=stl`. Override Replicate inputs with repeated
+`--param key=value` flags, including `--param model=<owner>/<model>` when you
+want to try a different Replicate model.
+
 ## Create A Project
 
 A project is one coherent style boundary: one army, collection, product line,
@@ -233,14 +268,14 @@ Drag the generated image into the browser cropper, or use the upload control.
 Draw labelled regions such as `front` and `back`, then save. The cropper stores
 the original image, the reusable crop geometry, and the cropped view images.
 
-Submit the cropped views to Meshy:
+Submit the cropped views to the default backend, Meshy:
 
 ```bash
 pb upload hq-lieutenant v1
 ```
 
 `pb upload` submits the task and exits. It does not poll forever and does not
-download the model. This keeps the Meshy judgement step explicit.
+download the model. This keeps the mesh judgement step explicit.
 
 Check progress:
 
@@ -252,6 +287,12 @@ To use Hi3D instead:
 
 ```bash
 pb upload hq-lieutenant v1 --backend hi3d
+```
+
+To use Replicate instead:
+
+```bash
+pb upload hq-lieutenant v1 --backend replicate
 ```
 
 When the result is worth keeping, fetch it:
@@ -365,7 +406,7 @@ Important files:
 
 - `sources/`: original images from the image-generation tool.
 - `regions.json`: labelled crop boxes, so cropping is repeatable.
-- `front.png`, `back.png`, etc.: extracted views sent to Meshy.
+- `front.png`, `back.png`, etc.: extracted views sent to the selected backend.
 - `task.json`: backend task id and upload metadata.
 - `model.stl`: downloaded only after `pb fetch` when the backend output is STL.
 
@@ -406,6 +447,20 @@ The API returns a temporary model URL when the task succeeds. `pb fetch`
 downloads that URL into the variant folder and records the local filename in
 `task.json`.
 
+### Replicate
+
+Replicate is a generic prediction API, not one fixed 3D API. `pb` creates an
+async prediction, stores the prediction id in `task.json`, polls it through
+`pb status`, and downloads the selected file output through `pb fetch`.
+
+The first supported mapping targets `hyper3d/rodin`, because it accepts
+multi-view image inputs and can return STL. `pb` sends data URI inputs from the
+local crop PNGs. Replicate recommends hosted files for larger inputs, so very
+large crops may need resizing or a future hosted-file upload path.
+
+Replicate API prediction input and output data is retained for a limited time by
+default. Fetch outputs you want to keep.
+
 ## Troubleshooting
 
 `pb: command not found`
@@ -441,6 +496,14 @@ export HI3D_CLIENT_ID=...
 export HI3D_CLIENT_SECRET=...
 ```
 
+`REPLICATE_API_TOKEN not set`
+
+Create a token from Replicate, then set it in your shell:
+
+```bash
+export REPLICATE_API_TOKEN=r8_...
+```
+
 Model exists over the API but not on the Meshy site
 
 Meshy API tasks may not appear in the normal web gallery. Use `pb status` and
@@ -474,8 +537,8 @@ pb fetch hq-lieutenant v1 --wait
 No `model.stl`
 
 The model is only downloaded after `pb fetch`. `pb upload` intentionally does
-not download anything. Hi3D can return other formats if you override
-`--param format=...`; `pb open` uses the fetched filename recorded in
+not download anything. Hi3D and Replicate can return other formats if you
+override backend parameters; `pb open` uses the fetched filename recorded in
 `task.json`.
 
 ## Command Reference
